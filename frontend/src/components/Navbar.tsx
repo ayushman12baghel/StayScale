@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Building2, Compass, CalendarCheck2, Database } from "lucide-react";
+import { Building2, Compass, CalendarCheck2, ShieldCheck } from "lucide-react";
 
 export function Navbar() {
   return (
@@ -38,20 +38,17 @@ export function Navbar() {
             <span>Explore Stays</span>
           </Link>
 
-          <span
-            title="Checkout holds & My Bookings unlock in Part 2"
-            className="hidden sm:inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-slate-400 cursor-not-allowed"
+          <Link
+            href="/bookings"
+            className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-slate-700 hover:bg-slate-100 hover:text-blue-600 transition-colors"
           >
-            <CalendarCheck2 className="h-4 w-4" />
+            <CalendarCheck2 className="h-4 w-4 text-blue-600" />
             <span>My Bookings</span>
-            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-500">
-              Part 2
-            </span>
-          </span>
+          </Link>
 
-          <div className="hidden md:flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
-            <Database className="h-3.5 w-3.5" />
-            <span>Part 1 · Postgres Only</span>
+          <div className="hidden md:flex items-center gap-1.5 rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            <span>Part 2 · Redis Holds &amp; Locks</span>
           </div>
         </nav>
       </div>

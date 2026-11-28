@@ -133,10 +133,13 @@ export function HotelCard({
               <p className="text-[11px] text-slate-500">Starting per night</p>
               <p className="text-2xl font-extrabold tracking-tight text-rose-600">
                 {formatINR(hotel.startingNightlyPriceMinor)}
+                <span className="text-xs font-semibold text-slate-500"> /night</span>
               </p>
-              <p className="text-[11px] font-medium text-slate-600">
-                Total {formatINR(hotel.totalStayPriceMinor)} ({hotel.totalNights}{" "}
-                {hotel.totalNights === 1 ? "night" : "nights"})
+              <p className="text-xs font-bold text-slate-800">
+                Total {formatINR(hotel.totalStayPriceMinor)}{" "}
+                <span className="font-normal text-slate-500">
+                  ({hotel.totalNights} {hotel.totalNights === 1 ? "night" : "nights"})
+                </span>
               </p>
 
               <Link

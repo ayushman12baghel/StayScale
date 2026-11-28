@@ -35,10 +35,10 @@ export default function RootLayout({
         <footer className="border-t border-slate-200 bg-white py-6 text-xs text-slate-500">
           <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-2 px-4 sm:flex-row sm:px-6">
             <p>
-              <span className="font-semibold text-slate-700">StayScale</span> · Part 1:
-              PostgreSQL Date-Partitioned Inventory &amp; Search
+              <span className="font-semibold text-slate-700">StayScale</span> · Part 2:
+              Dynamic Pricing, 10-Min Redis Holds &amp; Atomic Bookings
             </p>
-            <p>Next up: Part 2 (10-min Redis Holds + Postgres Row Locks + Checkout)</p>
+            <p>Next up: Part 3 (Search Cache-Aside, Rate Limiting &amp; A/B Ranking)</p>
           </div>
         </footer>
       </body>
