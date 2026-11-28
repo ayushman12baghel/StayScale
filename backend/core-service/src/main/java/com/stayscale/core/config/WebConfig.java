@@ -22,7 +22,7 @@ public class WebConfig implements WebMvcConfigurer {
                 .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
                 .allowedHeaders("*")
                 // Browsers hide custom response headers from fetch() unless explicitly listed here.
-                .exposedHeaders("X-Trace-Id", "X-Experiment-Variant", "X-Cache-Status")
+                .exposedHeaders("X-Trace-Id", "X-Experiment-Variant", "X-Cache-Status", "X-Idempotency-Replayed")
                 .maxAge(3600);
     }
 }
