@@ -51,6 +51,34 @@ export interface PagedSearchResponse {
   queryDurationMs: number;
 }
 
+export interface PricingAdjustment {
+  ruleCode: string;
+  label: string;
+  percentageDelta: number;
+  amountDeltaMinor: number;
+  explanation: string;
+}
+
+export interface NightlyPriceQuote {
+  stayDate: string;
+  baseNightlyMinor: number;
+  dynamicNightlyMinor: number;
+  availableRooms: number;
+  adjustments: PricingAdjustment[];
+}
+
+export interface PriceQuoteResponse {
+  baseNightlyMinor: number;
+  averageDynamicNightlyMinor: number;
+  totalBaseMinor: number;
+  totalStayPriceMinor: number;
+  currency: string;
+  totalNights: number;
+  rooms: number;
+  ruleSummaries: PricingAdjustment[];
+  nightlyBreakdown: NightlyPriceQuote[];
+}
+
 export interface RoomType {
   id: string;
   name: string;
@@ -66,6 +94,7 @@ export interface RoomType {
   freeCancellation: boolean;
   breakfastIncluded: boolean;
   imageUrl: string;
+  dynamicPricing?: PriceQuoteResponse;
 }
 
 export interface HotelDetail {
@@ -93,6 +122,56 @@ export interface HotelDetail {
   guestsRequested: number;
   roomsRequested: number;
   roomTypes: RoomType[];
+}
+
+export interface HoldResponse {
+  holdId: string;
+  userId: string;
+  hotelId: string;
+  hotelName: string;
+  hotelCity: string;
+  hotelNeighborhood: string;
+  hotelImageUrl: string;
+  roomTypeId: string;
+  roomName: string;
+  roomImageUrl: string;
+  checkIn: string;
+  checkOut: string;
+  totalNights: number;
+  rooms: number;
+  guests: number;
+  expiresAt: string;
+  ttlSeconds: number;
+  pricing: PriceQuoteResponse;
+}
+
+export interface BookingResponse {
+  id: string;
+  userId: string;
+  holdId: string;
+  hotelId: string;
+  hotelName: string;
+  hotelCity: string;
+  hotelNeighborhood: string;
+  hotelImageUrl: string;
+  roomTypeId: string;
+  roomName: string;
+  checkIn: string;
+  checkOut: string;
+  totalNights: number;
+  roomsCount: number;
+  guestsCount: number;
+  nightlyBaseMinor: number;
+  totalPriceMinor: number;
+  currency: string;
+  pricingBreakdown: PricingAdjustment[];
+  status: "CONFIRMED" | "CANCELLED";
+  guestName: string;
+  guestEmail: string;
+  paymentReference: string;
+  experimentVariant: string;
+  cancelledAt: string | null;
+  createdAt: string;
 }
 
 export interface SearchParamsInput {

@@ -1,5 +1,7 @@
 import {
+  BookingResponse,
   CitySummary,
+  HoldResponse,
   HotelDetail,
   PagedSearchResponse,
   SearchParamsInput,
@@ -109,6 +111,108 @@ export async function fetchHotelDetail(
   qs.set("rooms", String(rooms));
 
   const res = await fetch(`${API_BASE}/api/v1/hotels/${id}?${qs.toString()}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res));
+  }
+  return res.json();
+}
+
+export async function createHold(
+  payload: {
+    roomTypeId: string;
+    checkIn: string;
+    checkOut: string;
+    rooms: number;
+    guests: number;
+  },
+  idempotencyKey: string,
+  userId: string
+): Promise<{ hold: HoldResponse; replayed: boolean; traceId: string | null }> {
+  const res = await fetch(`${API_BASE}/api/v1/holds`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+      "X-User-Id": userId,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res));
+  }
+  return {
+    hold: await res.json(),
+    replayed: res.headers.get("X-Idempotency-Replayed") === "true",
+    traceId: res.headers.get("X-Trace-Id"),
+  };
+}
+
+export async function fetchHold(holdId: string): Promise<HoldResponse> {
+  const res = await fetch(`${API_BASE}/api/v1/holds/${holdId}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res));
+  }
+  return res.json();
+}
+
+export async function confirmBooking(
+  payload: {
+    holdId: string;
+    guestName: string;
+    guestEmail: string;
+    paymentToken: string;
+  },
+  idempotencyKey: string,
+  userId: string
+): Promise<{ booking: BookingResponse; replayed: boolean; traceId: string | null }> {
+  const res = await fetch(`${API_BASE}/api/v1/bookings/confirm`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+      "X-User-Id": userId,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res));
+  }
+  return {
+    booking: await res.json(),
+    replayed: res.headers.get("X-Idempotency-Replayed") === "true",
+    traceId: res.headers.get("X-Trace-Id"),
+  };
+}
+
+export async function cancelBooking(
+  bookingId: string,
+  idempotencyKey: string
+): Promise<{ booking: BookingResponse; replayed: boolean; traceId: string | null }> {
+  const res = await fetch(`${API_BASE}/api/v1/bookings/${bookingId}/cancel`, {
+    method: "POST",
+    headers: {
+      "Idempotency-Key": idempotencyKey,
+    },
+  });
+  if (!res.ok) {
+    throw new Error(await parseErrorMessage(res));
+  }
+  return {
+    booking: await res.json(),
+    replayed: res.headers.get("X-Idempotency-Replayed") === "true",
+    traceId: res.headers.get("X-Trace-Id"),
+  };
+}
+
+export async function fetchMyBookings(userId: string): Promise<BookingResponse[]> {
+  const res = await fetch(`${API_BASE}/api/v1/bookings`, {
+    headers: {
+      "X-User-Id": userId,
+    },
     cache: "no-store",
   });
   if (!res.ok) {
