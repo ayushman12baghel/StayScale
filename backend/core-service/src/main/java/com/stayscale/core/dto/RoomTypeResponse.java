@@ -1,7 +1,12 @@
 package com.stayscale.core.dto;
 
+import com.stayscale.core.pricing.PriceQuoteResponse;
+
 import java.util.UUID;
 
+/**
+ * Room-type availability and live dynamic pricing returned on the hotel detail page.
+ */
 public record RoomTypeResponse(
         UUID id,
         String name,
@@ -16,5 +21,6 @@ public record RoomTypeResponse(
         int availableRooms,
         boolean freeCancellation,
         boolean breakfastIncluded,
-        String imageUrl
+        String imageUrl,
+        PriceQuoteResponse dynamicPricing
 ) {}

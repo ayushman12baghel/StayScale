@@ -5,15 +5,24 @@ import com.stayscale.core.dto.HotelDetailResponse;
 import com.stayscale.core.dto.HotelSearchCriteria;
 import com.stayscale.core.dto.HotelSearchItemResponse;
 import com.stayscale.core.dto.RoomTypeResponse;
+import com.stayscale.core.pricing.DynamicPricingEngine;
+import com.stayscale.core.pricing.DynamicPricingEngine.NightInventorySnapshot;
+import com.stayscale.core.pricing.PriceQuoteResponse;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
+import tools.jackson.databind.ObjectMapper;
 
 import java.sql.Array;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -24,7 +33,7 @@ import java.util.UUID;
  *
  * <p>Why {@link NamedParameterJdbcTemplate} instead of Spring Data JPA entities?
  * Hotel availability search relies on date-partitioned aggregations, PostgreSQL JSONB
- * operators ({@code ?&}), and explicit covering-index queries. Writing the SQL directly
+ * containment ({@code @>}), and explicit covering-index queries. Writing the SQL directly
  * prevents hidden N+1 queries and lets us verify index usage with {@code EXPLAIN ANALYZE}.
  */
 @Repository
@@ -42,9 +51,17 @@ public class HotelSearchRepository {
     );
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final DynamicPricingEngine pricingEngine;
+    private final ObjectMapper objectMapper;
 
-    public HotelSearchRepository(NamedParameterJdbcTemplate jdbc) {
+    public HotelSearchRepository(
+            NamedParameterJdbcTemplate jdbc,
+            DynamicPricingEngine pricingEngine,
+            ObjectMapper objectMapper
+    ) {
         this.jdbc = jdbc;
+        this.pricingEngine = pricingEngine;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -83,16 +100,10 @@ public class HotelSearchRepository {
     }
 
     /**
-     * Finds hotels that have enough rooms available on EVERY night of the requested stay.
-     *
-     * <p>How the two-stage CTE works:
-     * <ol>
-     *   <li>{@code available_rooms_agg}: filters daily inventory rows to {@code [checkIn, checkOut)}
-     *       using the covering index {@code idx_inventory_date_avail_room}, then keeps only room types
-     *       where {@code COUNT(*) = totalNights} (proving every single night has stock >= requested rooms).</li>
-     *   <li>{@code hotel_agg}: collapses qualifying room types to one summary row per hotel
-     *       (cheapest qualifying nightly rate, best availability, and perk flags).</li>
-     * </ol>
+     * Finds hotels that have enough rooms available on EVERY night of the requested stay,
+     * evaluates live {@link DynamicPricingEngine} rules per qualifying room type, and
+     * applies budget filtering, sorting, and pagination on the exact dynamic nightly price
+     * so search cards always match the hotel detail page.
      */
     public SearchQueryResult searchHotels(HotelSearchCriteria criteria) {
         MapSqlParameterSource params = new MapSqlParameterSource()
@@ -100,11 +111,9 @@ public class HotelSearchRepository {
                 .addValue("checkOut", criteria.checkOut())
                 .addValue("totalNights", criteria.totalNights())
                 .addValue("rooms", criteria.rooms())
-                .addValue("guestsPerRoom", criteria.guestsPerRoom())
-                .addValue("limit", criteria.size())
-                .addValue("offset", criteria.page() * criteria.size());
+                .addValue("guestsPerRoom", criteria.guestsPerRoom());
 
-        // Dynamically append optional sidebar filters while keeping every value parameterized (SQL-injection safe).
+        // Dynamically append optional hotel-level filters while keeping every value parameterized.
         StringBuilder whereClause = new StringBuilder(" WHERE 1=1 ");
 
         if (criteria.city() != null && !criteria.city().isBlank()) {
@@ -124,22 +133,18 @@ public class HotelSearchRepository {
             whereClause.append(" AND h.guest_score >= :minRating ");
             params.addValue("minRating", criteria.minRating());
         }
-        if (criteria.maxPriceMinor() != null) {
-            whereClause.append(" AND ha.starting_nightly_price_minor <= :maxPriceMinor ");
-            params.addValue("maxPriceMinor", criteria.maxPriceMinor());
-        }
         if (criteria.amenities() != null && !criteria.amenities().isEmpty()) {
-            // PostgreSQL '?&' checks that the JSONB array contains ALL requested amenity strings (uses GIN index).
-            whereClause.append(" AND h.amenities ?& :amenitiesArr ");
-            params.addValue("amenitiesArr", criteria.amenities().toArray(String[]::new));
+            // PostgreSQL JSONB containment '@>' checks that h.amenities contains ALL requested tags.
+            // It natively uses idx_hotels_amenities_gin and avoids '?' JDBC placeholder conflicts with '?&'.
+            whereClause.append(" AND h.amenities @> CAST(:amenitiesJson AS jsonb) ");
+            params.addValue("amenitiesJson", objectMapper.writeValueAsString(criteria.amenities()));
         }
 
         // Note: check_out is exclusive (>= checkIn AND < checkOut) because you don't sleep on checkout night.
-        // We take MAX(min_available_rooms) across room types so "Only 2 left!" only warns when EVERY eligible room type is scarce.
-        String cte = """
-                WITH available_rooms_agg AS (
-                    SELECT rt.hotel_id,
-                           rt.id AS room_type_id,
+        String sql = """
+                WITH qualifying_rooms AS (
+                    SELECT rt.id AS room_type_id,
+                           rt.hotel_id,
                            rt.base_price_minor,
                            rt.currency,
                            rt.free_cancellation,
@@ -151,37 +156,11 @@ public class HotelSearchRepository {
                       AND inv.stay_date < :checkOut
                       AND inv.available_rooms >= :rooms
                       AND rt.max_guests >= :guestsPerRoom
-                    GROUP BY rt.hotel_id, rt.id, rt.base_price_minor, rt.currency,
+                    GROUP BY rt.id, rt.hotel_id, rt.base_price_minor, rt.currency,
                              rt.free_cancellation, rt.breakfast_included
                     HAVING COUNT(*) = :totalNights
-                ),
-                hotel_agg AS (
-                    SELECT hotel_id,
-                           MIN(base_price_minor) AS starting_nightly_price_minor,
-                           MIN(currency) AS currency,
-                           MAX(min_available_rooms) AS max_available_rooms,
-                           BOOL_OR(free_cancellation) AS free_cancellation_available,
-                           BOOL_OR(breakfast_included) AS breakfast_included_available
-                    FROM available_rooms_agg
-                    GROUP BY hotel_id
                 )
-                """;
-
-        // Run a separate COUNT(*) with identical WHERE filters so totalElements & pagination remain accurate on any page.
-        String countSql = cte + """
-                SELECT COUNT(*)
-                FROM hotels h
-                JOIN hotel_agg ha ON ha.hotel_id = h.id
-                """ + whereClause;
-
-        Long total = jdbc.queryForObject(countSql, params, Long.class);
-        long totalElements = total != null ? total : 0L;
-
-        // Convert JSONB arrays into PostgreSQL text[] inline via ARRAY(SELECT jsonb_array_elements_text(...))
-        // so JDBC maps them directly to String[] without coupling to a specific Jackson version.
-        String orderBy = resolveOrderBy(criteria.sort());
-        String dataSql = cte + """
-                SELECT h.id,
+                SELECT h.id AS hotel_id,
                        h.name,
                        h.city,
                        h.country,
@@ -197,53 +176,142 @@ public class HotelSearchRepository {
                        h.property_type,
                        h.image_url,
                        ARRAY(SELECT jsonb_array_elements_text(h.amenities)) AS amenities_arr,
-                       ha.starting_nightly_price_minor,
-                       ha.currency,
-                       ha.max_available_rooms,
-                       ha.free_cancellation_available,
-                       ha.breakfast_included_available
+                       qr.room_type_id,
+                       qr.base_price_minor,
+                       qr.currency,
+                       qr.free_cancellation,
+                       qr.breakfast_included,
+                       qr.min_available_rooms,
+                       inv.stay_date,
+                       inv.total_rooms,
+                       inv.available_rooms
                 FROM hotels h
-                JOIN hotel_agg ha ON ha.hotel_id = h.id
-                """ + whereClause + " ORDER BY " + orderBy + " LIMIT :limit OFFSET :offset ";
+                JOIN qualifying_rooms qr ON qr.hotel_id = h.id
+                JOIN room_inventory_by_date inv
+                  ON inv.room_type_id = qr.room_type_id
+                 AND inv.stay_date >= :checkIn
+                 AND inv.stay_date < :checkOut
+                """ + whereClause + " ORDER BY h.id, qr.room_type_id, inv.stay_date ASC ";
 
-        int totalNights = criteria.totalNights();
-        int roomsRequested = criteria.rooms();
-        List<HotelSearchItemResponse> items = jdbc.query(dataSql, params, (rs, rowNum) -> {
-            long nightly = rs.getLong("starting_nightly_price_minor");
-            // Integer minor-unit multiplication avoids floating-point rounding bugs on currency totals.
-            long totalStay = nightly * totalNights * roomsRequested;
-            return new HotelSearchItemResponse(
-                    rs.getObject("id", UUID.class),
-                    rs.getString("name"),
-                    rs.getString("city"),
-                    rs.getString("country"),
-                    rs.getString("neighborhood"),
-                    rs.getString("address"),
-                    rs.getDouble("latitude"),
-                    rs.getDouble("longitude"),
-                    rs.getString("landmark_name"),
-                    rs.getDouble("distance_to_center_km"),
-                    rs.getInt("star_rating"),
-                    rs.getDouble("guest_score"),
-                    rs.getInt("review_count"),
-                    rs.getString("property_type"),
-                    rs.getString("image_url"),
-                    readTextArray(rs, "amenities_arr"),
-                    nightly,
-                    totalStay,
-                    rs.getString("currency"),
-                    totalNights,
-                    rs.getInt("max_available_rooms"),
-                    rs.getBoolean("free_cancellation_available"),
-                    rs.getBoolean("breakfast_included_available")
-            );
+        Map<UUID, HotelAccumulator> byHotel = new LinkedHashMap<>();
+        jdbc.query(sql, params, rs -> {
+            UUID hotelId = rs.getObject("hotel_id", UUID.class);
+            HotelAccumulator hotelAcc = byHotel.computeIfAbsent(hotelId, id -> {
+                try {
+                    return new HotelAccumulator(
+                            id,
+                            rs.getString("name"),
+                            rs.getString("city"),
+                            rs.getString("country"),
+                            rs.getString("neighborhood"),
+                            rs.getString("address"),
+                            rs.getDouble("latitude"),
+                            rs.getDouble("longitude"),
+                            rs.getString("landmark_name"),
+                            rs.getDouble("distance_to_center_km"),
+                            rs.getInt("star_rating"),
+                            rs.getDouble("guest_score"),
+                            rs.getInt("review_count"),
+                            rs.getString("property_type"),
+                            rs.getString("image_url"),
+                            readTextArray(rs, "amenities_arr")
+                    );
+                } catch (SQLException ex) {
+                    throw new RuntimeException(ex);
+                }
+            });
+
+            UUID roomId = rs.getObject("room_type_id", UUID.class);
+            RoomAccumulator roomAcc = hotelAcc.rooms.computeIfAbsent(roomId, id -> {
+                try {
+                    return new RoomAccumulator(
+                            rs.getLong("base_price_minor"),
+                            rs.getString("currency"),
+                            rs.getBoolean("free_cancellation"),
+                            rs.getBoolean("breakfast_included"),
+                            rs.getInt("min_available_rooms")
+                    );
+                } catch (SQLException ex) {
+                    throw new RuntimeException(ex);
+                }
+            });
+
+            roomAcc.nights.add(new NightInventorySnapshot(
+                    rs.getObject("stay_date", LocalDate.class),
+                    rs.getInt("total_rooms"),
+                    rs.getInt("available_rooms")
+            ));
         });
 
-        return new SearchQueryResult(items, totalElements);
+        LocalDate today = LocalDate.now();
+        int totalNights = criteria.totalNights();
+        int roomsRequested = criteria.rooms();
+
+        List<HotelSearchItemResponse> allMatching = new ArrayList<>();
+        for (HotelAccumulator h : byHotel.values()) {
+            long minNightly = Long.MAX_VALUE;
+            long minTotal = Long.MAX_VALUE;
+            String currency = "INR";
+            int maxAvail = 0;
+            boolean freeCancelAny = false;
+            boolean breakfastAny = false;
+
+            for (RoomAccumulator r : h.rooms.values()) {
+                PriceQuoteResponse quote = pricingEngine.calculateQuote(
+                        r.basePriceMinor, r.currency, roomsRequested, r.nights, today);
+                if (quote.averageDynamicNightlyMinor() < minNightly) {
+                    minNightly = quote.averageDynamicNightlyMinor();
+                    minTotal = quote.totalStayPriceMinor();
+                    currency = quote.currency();
+                }
+                if (r.minAvailableRooms > maxAvail) {
+                    maxAvail = r.minAvailableRooms;
+                }
+                freeCancelAny |= r.freeCancellation;
+                breakfastAny |= r.breakfastIncluded;
+            }
+
+            if (criteria.maxPriceMinor() != null && minNightly > criteria.maxPriceMinor()) {
+                continue;
+            }
+
+            allMatching.add(new HotelSearchItemResponse(
+                    h.id,
+                    h.name,
+                    h.city,
+                    h.country,
+                    h.neighborhood,
+                    h.address,
+                    h.latitude,
+                    h.longitude,
+                    h.landmarkName,
+                    h.distanceToCenterKm,
+                    h.starRating,
+                    h.guestScore,
+                    h.reviewCount,
+                    h.propertyType,
+                    h.imageUrl,
+                    h.amenities,
+                    minNightly,
+                    minTotal,
+                    currency,
+                    totalNights,
+                    maxAvail,
+                    freeCancelAny,
+                    breakfastAny
+            ));
+        }
+
+        allMatching.sort(buildComparator(criteria.sort()));
+
+        long totalElements = allMatching.size();
+        int fromIdx = Math.min(criteria.page() * criteria.size(), allMatching.size());
+        int toIdx = Math.min(fromIdx + criteria.size(), allMatching.size());
+        return new SearchQueryResult(allMatching.subList(fromIdx, toIdx), totalElements);
     }
 
     /**
-     * Loads full property metadata plus every room type's availability for the requested dates.
+     * Loads full property metadata plus every room type's availability and live dynamic pricing.
      *
      * <p>Unlike {@link #searchHotels}, this uses a {@code LEFT JOIN} on inventory so room types
      * that are sold out for the chosen dates still appear on the hotel page labeled "Sold out",
@@ -256,7 +324,7 @@ public class HotelSearchRepository {
             int guests,
             int rooms
     ) {
-        int totalNights = (int) java.time.temporal.ChronoUnit.DAYS.between(checkIn, checkOut);
+        int totalNights = (int) ChronoUnit.DAYS.between(checkIn, checkOut);
         MapSqlParameterSource hotelParams = new MapSqlParameterSource("hotelId", hotelId);
 
         String hotelSql = """
@@ -302,8 +370,32 @@ public class HotelSearchRepository {
                 .addValue("checkOut", checkOut)
                 .addValue("totalNights", totalNights);
 
-        // If any night in [checkIn, checkOut) is missing a row (COUNT < totalNights), treat available_rooms as 0.
-        // Otherwise take MIN(available_rooms) across all stayed nights (the bottleneck night limits how many rooms can be booked).
+        // Fetch per-night snapshots across all room types of this hotel in one query so
+        // DynamicPricingEngine can compute live surge/weekend/early-bird adjustments.
+        String nightlySql = """
+                SELECT rt.id AS room_type_id,
+                       inv.stay_date,
+                       inv.total_rooms,
+                       inv.available_rooms
+                FROM room_types rt
+                JOIN room_inventory_by_date inv ON inv.room_type_id = rt.id
+                WHERE rt.hotel_id = :hotelId
+                  AND inv.stay_date >= :checkIn
+                  AND inv.stay_date < :checkOut
+                ORDER BY rt.id, inv.stay_date ASC
+                """;
+
+        Map<UUID, List<NightInventorySnapshot>> snapshotsByRoom = new HashMap<>();
+        jdbc.query(nightlySql, roomParams, rs -> {
+            UUID rtId = rs.getObject("room_type_id", UUID.class);
+            snapshotsByRoom.computeIfAbsent(rtId, k -> new ArrayList<>())
+                    .add(new NightInventorySnapshot(
+                            rs.getObject("stay_date", LocalDate.class),
+                            rs.getInt("total_rooms"),
+                            rs.getInt("available_rooms")
+                    ));
+        });
+
         String roomsSql = """
                 SELECT rt.id,
                        rt.name,
@@ -333,23 +425,34 @@ public class HotelSearchRepository {
                 ORDER BY rt.base_price_minor ASC
                 """;
 
+        LocalDate today = LocalDate.now();
         List<RoomTypeResponse> roomTypes = jdbc.query(roomsSql, roomParams, (rs, rowNum) -> {
-            long nightly = rs.getLong("base_price_minor");
+            UUID roomId = rs.getObject("id", UUID.class);
+            long baseNightly = rs.getLong("base_price_minor");
+            String currency = rs.getString("currency");
+            List<NightInventorySnapshot> nights = snapshotsByRoom.getOrDefault(roomId, List.of());
+
+            PriceQuoteResponse quote = nights.size() == totalNights
+                    ? pricingEngine.calculateQuote(baseNightly, currency, rooms, nights, today)
+                    : new PriceQuoteResponse(baseNightly, baseNightly, baseNightly * totalNights * rooms,
+                    baseNightly * totalNights * rooms, currency, totalNights, rooms, List.of(), List.of());
+
             return new RoomTypeResponse(
-                    rs.getObject("id", UUID.class),
+                    roomId,
                     rs.getString("name"),
                     rs.getString("description"),
                     rs.getString("bed_type"),
                     rs.getInt("room_size_sqm"),
                     rs.getInt("max_guests"),
-                    nightly,
-                    nightly * totalNights * rooms,
-                    rs.getString("currency"),
+                    quote.averageDynamicNightlyMinor(),
+                    quote.totalStayPriceMinor(),
+                    currency,
                     rs.getInt("total_units"),
                     rs.getInt("available_rooms"),
                     rs.getBoolean("free_cancellation"),
                     rs.getBoolean("breakfast_included"),
-                    rs.getString("image_url")
+                    rs.getString("image_url"),
+                    quote
             );
         });
 
@@ -381,19 +484,19 @@ public class HotelSearchRepository {
         ));
     }
 
-    /**
-     * Whitelist-maps user sort options to safe ORDER BY expressions (never interpolate raw user input).
-     * Default "recommended" blends high guest score with lower price as a simple value score.
-     */
-    private String resolveOrderBy(String sort) {
-        if (sort == null) {
-            return "(h.guest_score * 10 - (ha.starting_nightly_price_minor / 150000.0)) DESC, h.review_count DESC";
-        }
-        return switch (sort.toLowerCase()) {
-            case "price_asc" -> "ha.starting_nightly_price_minor ASC, h.guest_score DESC";
-            case "price_desc" -> "ha.starting_nightly_price_minor DESC, h.guest_score DESC";
-            case "rating_desc" -> "h.guest_score DESC, h.review_count DESC";
-            default -> "(h.guest_score * 10 - (ha.starting_nightly_price_minor / 150000.0)) DESC, h.review_count DESC";
+    private Comparator<HotelSearchItemResponse> buildComparator(String sort) {
+        String key = sort == null ? "recommended" : sort.toLowerCase();
+        return switch (key) {
+            case "price_asc" -> Comparator.comparingLong(HotelSearchItemResponse::startingNightlyPriceMinor)
+                    .thenComparing(Comparator.comparingDouble(HotelSearchItemResponse::guestScore).reversed());
+            case "price_desc" -> Comparator.comparingLong(HotelSearchItemResponse::startingNightlyPriceMinor).reversed()
+                    .thenComparing(Comparator.comparingDouble(HotelSearchItemResponse::guestScore).reversed());
+            case "rating_desc" -> Comparator.comparingDouble(HotelSearchItemResponse::guestScore).reversed()
+                    .thenComparing(Comparator.comparingInt(HotelSearchItemResponse::reviewCount).reversed());
+            default -> Comparator.comparingDouble((HotelSearchItemResponse h) ->
+                            h.guestScore() * 10.0 - (h.startingNightlyPriceMinor() / 150_000.0))
+                    .reversed()
+                    .thenComparing(Comparator.comparingInt(HotelSearchItemResponse::reviewCount).reversed());
         };
     }
 
@@ -407,6 +510,66 @@ public class HotelSearchRepository {
     }
 
     public record SearchQueryResult(List<HotelSearchItemResponse> items, long totalElements) {}
+
+    private static final class HotelAccumulator {
+        final UUID id;
+        final String name;
+        final String city;
+        final String country;
+        final String neighborhood;
+        final String address;
+        final double latitude;
+        final double longitude;
+        final String landmarkName;
+        final double distanceToCenterKm;
+        final int starRating;
+        final double guestScore;
+        final int reviewCount;
+        final String propertyType;
+        final String imageUrl;
+        final List<String> amenities;
+        final Map<UUID, RoomAccumulator> rooms = new LinkedHashMap<>();
+
+        HotelAccumulator(UUID id, String name, String city, String country, String neighborhood,
+                         String address, double latitude, double longitude, String landmarkName,
+                         double distanceToCenterKm, int starRating, double guestScore, int reviewCount,
+                         String propertyType, String imageUrl, List<String> amenities) {
+            this.id = id;
+            this.name = name;
+            this.city = city;
+            this.country = country;
+            this.neighborhood = neighborhood;
+            this.address = address;
+            this.latitude = latitude;
+            this.longitude = longitude;
+            this.landmarkName = landmarkName;
+            this.distanceToCenterKm = distanceToCenterKm;
+            this.starRating = starRating;
+            this.guestScore = guestScore;
+            this.reviewCount = reviewCount;
+            this.propertyType = propertyType;
+            this.imageUrl = imageUrl;
+            this.amenities = amenities;
+        }
+    }
+
+    private static final class RoomAccumulator {
+        final long basePriceMinor;
+        final String currency;
+        final boolean freeCancellation;
+        final boolean breakfastIncluded;
+        final int minAvailableRooms;
+        final List<NightInventorySnapshot> nights = new ArrayList<>();
+
+        RoomAccumulator(long basePriceMinor, String currency, boolean freeCancellation,
+                        boolean breakfastIncluded, int minAvailableRooms) {
+            this.basePriceMinor = basePriceMinor;
+            this.currency = currency;
+            this.freeCancellation = freeCancellation;
+            this.breakfastIncluded = breakfastIncluded;
+            this.minAvailableRooms = minAvailableRooms;
+        }
+    }
 
     private record HotelHeaderRow(
             UUID id,
